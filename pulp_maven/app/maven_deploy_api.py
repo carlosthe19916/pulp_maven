@@ -21,7 +21,7 @@ from pulp_maven.app.models import (
     MavenPackage,
     MavenRepository,
 )
-from pulp_maven.app.tasks import aadd_and_remove
+from pulp_maven.app.tasks import METADATA_FILENAMES, aadd_and_remove
 
 
 def has_task_completed(task):
@@ -153,6 +153,17 @@ class MavenApiViewSet(APIView):
                 content = MavenArtifact.init_from_artifact_and_relative_path(artifact, path)
         except ValueError as e:
             return Response({"error": str(e)}, status=400)
+
+        # Pulp owns the repo-level version list and its generated checksums.
+        # Acknowledge Maven deploy uploads while preserving SNAPSHOT and plugin metadata.
+        if (
+            is_metadata
+            and content.filename in METADATA_FILENAMES
+            and content.version is None
+            and content.artifact_id
+        ):
+            return Response(status=201)
+
         try:
             content.save()
         except IntegrityError:

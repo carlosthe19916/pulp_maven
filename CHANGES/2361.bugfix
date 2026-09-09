@@ -1,0 +1,2 @@
+Prevent Maven deploy uploads of repo-level metadata and its generated checksums from replacing
+Pulp's version list, while preserving version-level SNAPSHOT and Maven plugin metadata uploads.

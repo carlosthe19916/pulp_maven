@@ -33,6 +33,20 @@ For each affected `(group_id, artifact_id)` pair, Pulp creates:
 For SNAPSHOT versions, the same set of files is also generated under
 `<group_path>/<artifact_id>/<version>/`.
 
+### Metadata uploaded during Maven deployment
+
+Maven deployment clients upload their own `maven-metadata.xml` files after uploading packages.
+Pulp acknowledges valid uploads of the repo-level version list and its `md5`, `sha1`, and `sha256`
+checksums without replacing its generated files or creating another repository version. The served
+version list continues to reflect the packages in the repository.
+
+Version-level SNAPSHOT metadata and group-level Maven plugin metadata are still accepted. SNAPSHOT
+metadata can contain the timestamped filenames needed to resolve deployed artifacts.
+
+This behavior applies to the Maven deploy API. Metadata uploads and modifications through the
+management API retain their existing behavior. Repositories with existing inconsistencies can use
+the [repair metadata](#repair-metadata) action below.
+
 ## Simplified workflow
 
 The typical workflow for serving Maven content through Pulp is:
