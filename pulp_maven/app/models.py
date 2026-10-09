@@ -650,19 +650,33 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
         """Remove the repository's Bloom filter from Redis."""
         delete_bloom_filter(self)
 
-    def _ensure_packages(self, new_version):
-        """Manage MavenPackage version membership. Creates missing packages when a POM is available."""
+    def _ensure_packages(self, new_version, full_scan=False):
+        """Manage MavenPackage version membership. Creates missing packages when a POM is available.
+
+        By default this is incremental: only GAVs touched by ``new_version.added()`` /
+        ``removed()`` are reconciled. With ``full_scan=True`` every GAV present in the version is
+        reconciled, so stranded packages (POM present but no MavenPackage) get associated. This is
+        the mode used by the ``repair_packages`` task (PULP-2478).
+        """
         from django.db.models import Q
 
         from pulpcore.plugin.models import ContentArtifact
 
         affected_gavs = set()
-        for qs in (
-            MavenArtifact.objects.filter(pk__in=new_version.added()),
-            MavenArtifact.objects.filter(pk__in=new_version.removed()),
-        ):
-            for vals in qs.values("group_id", "artifact_id", "version").distinct().iterator():
-                affected_gavs.add((vals["group_id"], vals["artifact_id"], vals["version"]))
+        if full_scan:
+            affected_gavs = set(
+                MavenArtifact.objects.filter(pk__in=new_version.content)
+                .values_list("group_id", "artifact_id", "version")
+                .distinct()
+                .iterator()
+            )
+        else:
+            for qs in (
+                MavenArtifact.objects.filter(pk__in=new_version.added()),
+                MavenArtifact.objects.filter(pk__in=new_version.removed()),
+            ):
+                for vals in qs.values("group_id", "artifact_id", "version").distinct().iterator():
+                    affected_gavs.add((vals["group_id"], vals["artifact_id"], vals["version"]))
 
         if not affected_gavs:
             return

@@ -1,0 +1,1 @@
+Added a ``repair_packages`` action to Maven repositories that backfills missing ``MavenPackage`` content for POMs already present in the latest version, so previously stranded packages become listed by the ``packages/`` API. The task is add-only and idempotent.
