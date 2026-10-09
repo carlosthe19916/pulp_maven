@@ -650,33 +650,19 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
         """Remove the repository's Bloom filter from Redis."""
         delete_bloom_filter(self)
 
-    def _ensure_packages(self, new_version, full_scan=False):
-        """Manage MavenPackage version membership. Creates missing packages when a POM is available.
-
-        By default this is incremental: only GAVs touched by ``new_version.added()`` /
-        ``removed()`` are reconciled. With ``full_scan=True`` every GAV present in the version is
-        reconciled, so stranded packages (POM present but no MavenPackage) get associated. This is
-        the mode used by the ``repair_packages`` task (PULP-2478).
-        """
+    def _ensure_packages(self, new_version):
+        """Manage MavenPackage version membership. Creates missing packages when a POM is available."""
         from django.db.models import Q
 
         from pulpcore.plugin.models import ContentArtifact
 
         affected_gavs = set()
-        if full_scan:
-            affected_gavs = set(
-                MavenArtifact.objects.filter(pk__in=new_version.content)
-                .values_list("group_id", "artifact_id", "version")
-                .distinct()
-                .iterator()
-            )
-        else:
-            for qs in (
-                MavenArtifact.objects.filter(pk__in=new_version.added()),
-                MavenArtifact.objects.filter(pk__in=new_version.removed()),
-            ):
-                for vals in qs.values("group_id", "artifact_id", "version").distinct().iterator():
-                    affected_gavs.add((vals["group_id"], vals["artifact_id"], vals["version"]))
+        for qs in (
+            MavenArtifact.objects.filter(pk__in=new_version.added()),
+            MavenArtifact.objects.filter(pk__in=new_version.removed()),
+        ):
+            for vals in qs.values("group_id", "artifact_id", "version").distinct().iterator():
+                affected_gavs.add((vals["group_id"], vals["artifact_id"], vals["version"]))
 
         if not affected_gavs:
             return
@@ -765,6 +751,142 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
                 pk__in=new_version.content, _pulp_domain=self.pulp_domain
             ).filter(dead_q)
             new_version.remove_content(dead_pkgs)
+
+    def _ensure_packages_full_scan(self, new_version):
+        """Reconcile MavenPackage membership across the ENTIRE version (repair_packages, PULP-2478).
+
+        Unlike the incremental path, this scans the whole version and diffs in-memory sets instead of
+        building per-GAV ``OR`` filters -- the incremental path's ``OR``-of-``Q`` would exceed
+        PostgreSQL's 65535 bound-parameter limit at ~16-21k GAVs. POM parsing (S3 reads) is
+        parallelized. It associates every POM-backed GAV's package (creating missing ones) and
+        removes packages whose GAV no longer has a POM in the version.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from pulpcore.plugin.models import ContentArtifact
+
+        from pulp_maven.app.pom import parse_pom_metadata
+
+        meta_fields = (
+            "name",
+            "description",
+            "packaging",
+            "url",
+            "licenses",
+            "dependencies",
+            "scm_url",
+        )
+
+        def _chunked(seq, size=1000):
+            seq = list(seq)
+            for i in range(0, len(seq), size):
+                yield seq[i : i + size]
+
+        # 1. POM-backed GAVs in the version, with each POM artifact's content pk.
+        pom_content_pk_by_gav = {}
+        for row in (
+            MavenArtifact.objects.filter(pk__in=new_version.content, filename__endswith=".pom")
+            .values("pk", "group_id", "artifact_id", "version", "filename")
+            .iterator()
+        ):
+            gav = (row["group_id"], row["artifact_id"], row["version"])
+            if row["filename"] == f"{gav[1]}-{gav[2]}.pom":
+                pom_content_pk_by_gav[gav] = row["pk"]
+        pom_gavs = set(pom_content_pk_by_gav)
+
+        # 2. MavenPackages already associated with this version (GAV -> pk).
+        pkg_pk_in_version = {
+            (g, a, v): pk
+            for g, a, v, pk in MavenPackage.objects.filter(pk__in=new_version.content)
+            .values_list("group_id", "artifact_id", "version", "pk")
+            .iterator()
+        }
+
+        # 3. All MavenPackages in the domain (GAV -> pk): lets us reuse existing rows and decide
+        #    which POM GAVs still need a package created.
+        domain_pkg_pk_by_gav = {
+            (g, a, v): pk
+            for g, a, v, pk in MavenPackage.objects.filter(_pulp_domain=self.pulp_domain)
+            .values_list("group_id", "artifact_id", "version", "pk")
+            .iterator()
+        }
+
+        # 4. POM GAVs that need a POM read: no package yet, or SNAPSHOT (refresh metadata).
+        gavs_needing_pom = {
+            gav
+            for gav in pom_gavs
+            if gav not in domain_pkg_pk_by_gav or gav[2].endswith("-SNAPSHOT")
+        }
+
+        # 5. Load those POM ContentArtifacts (chunked IN to stay under the param limit) and parse
+        #    them in parallel (the S3 reads are the dominant cost).
+        parsed_meta = {}
+        ca_by_gav = {}
+        if gavs_needing_pom:
+            pk_to_gav = {pom_content_pk_by_gav[g]: g for g in gavs_needing_pom}
+            for chunk in _chunked(pk_to_gav.keys()):
+                for ca in (
+                    ContentArtifact.objects.filter(content_id__in=chunk)
+                    .select_related("artifact")
+                    .iterator()
+                ):
+                    gav = pk_to_gav.get(ca.content_id)
+                    if gav and ca.artifact:
+                        ca_by_gav[gav] = ca
+
+            def _parse(ca):
+                try:
+                    with ca.artifact.file.open("rb") as fh:
+                        return parse_pom_metadata(fh)
+                except Exception:
+                    logger.warning("repair_packages: failed to parse POM %s", ca.artifact.file.name)
+                    return None
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = {pool.submit(_parse, ca): gav for gav, ca in ca_by_gav.items()}
+                for fut in as_completed(futures):
+                    parsed_meta[futures[fut]] = fut.result()
+
+        # 6. Create missing packages and apply parsed metadata (bulk-update the changed fields).
+        pkg_pk_by_gav = dict(domain_pkg_pk_by_gav)
+        to_update = []
+        created = 0
+        for gav in gavs_needing_pom:
+            # A brand-new package can't be created without a readable POM.
+            if gav not in domain_pkg_pk_by_gav and gav not in ca_by_gav:
+                continue
+            pkg, was_created = MavenPackage.objects.get_or_create(
+                group_id=gav[0], artifact_id=gav[1], version=gav[2], _pulp_domain=self.pulp_domain
+            )
+            pkg_pk_by_gav[gav] = pkg.pk
+            created += int(was_created)
+            meta = parsed_meta.get(gav)
+            if meta:
+                for field in meta_fields:
+                    setattr(pkg, field, meta[field])
+                to_update.append(pkg)
+        if to_update:
+            MavenPackage.objects.bulk_update(to_update, meta_fields, batch_size=500)
+
+        # 7. Associate every POM GAV's package that is not already in the version.
+        #    Chunk the pk__in so the membership queries stay well under Postgres's param limit.
+        want_pks = {pkg_pk_by_gav[g] for g in pom_gavs if g in pkg_pk_by_gav}
+        add_pks = want_pks - set(pkg_pk_in_version.values())
+        for chunk in _chunked(add_pks, 10000):
+            new_version.add_content(MavenPackage.objects.filter(pk__in=chunk))
+
+        # 8. Dead reconcile: drop version packages whose GAV no longer has a POM.
+        dead_pks = [pk for gav, pk in pkg_pk_in_version.items() if gav not in pom_gavs]
+        for chunk in _chunked(dead_pks, 10000):
+            new_version.remove_content(MavenPackage.objects.filter(pk__in=chunk))
+
+        logger.info(
+            "repair_packages: full-scan reconcile pom_gavs=%d created=%d associated=%d removed=%d",
+            len(pom_gavs),
+            created,
+            len(add_pks),
+            len(dead_pks),
+        )
 
     def _generate_metadata(self, new_version):
         """Generate maven-metadata.xml and checksums for affected (group_id, artifact_id) pairs."""

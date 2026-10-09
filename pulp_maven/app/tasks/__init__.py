@@ -729,12 +729,13 @@ def generate_bloom_filter(repository_pk):
 
 def repair_packages(repository_pk):
     """
-    Backfill missing MavenPackages for a repository (PULP-2478).
+    Backfill (and reconcile) MavenPackages for a repository (PULP-2478).
 
-    Phase 2, Step 3.5: safe & correct. Reports the gap, and when there are stranded
-    GAVs, associates the missing MavenPackages in a new version (full-scan). Add-only
-    (never removes content, so the repo is never emptied) and idempotent (a second run
-    finds nothing stranded and creates no new version).
+    Opens a new version and runs a full-scan reconcile: associate every POM-backed GAV's
+    MavenPackage (creating missing ones from the POM), and remove packages whose GAV no longer
+    has a POM. Add/remove are driven by in-memory set diffing so there is no practical GAV
+    ceiling, and POM parsing is parallelized. Idempotent: when nothing changes the empty draft
+    version is discarded, so no new version is created.
     """
     repository = MavenRepository.objects.get(pk=repository_pk)
     latest_version = repository.latest_version()
@@ -742,86 +743,27 @@ def repair_packages(repository_pk):
         log.info("repair_packages: repository %r has no version; nothing to do.", repository.name)
         return
 
-    artifact_count = MavenArtifact.objects.filter(pk__in=latest_version.content).count()
-    package_count = MavenPackage.objects.filter(pk__in=latest_version.content).count()
-
-    log.info(
-        "repair_packages: repository=%r version=%s | MavenArtifacts=%d MavenPackages=%d",
-        repository.name,
-        latest_version.number,
-        artifact_count,
-        package_count,
-    )
-
-    # A GAV is "POM-backed" when the version contains its {artifact_id}-{version}.pom artifact.
-    pom_gavs = set()
-    for row in (
-        MavenArtifact.objects.filter(pk__in=latest_version.content, filename__endswith=".pom")
-        .values("group_id", "artifact_id", "version", "filename")
-        .iterator()
-    ):
-        g, a, v, filename = row["group_id"], row["artifact_id"], row["version"], row["filename"]
-        if filename == f"{a}-{v}.pom":
-            pom_gavs.add((g, a, v))
-
-    log.info(
-        "repair_packages: found %d POM-backed GAV(s) in version %s:",
-        len(pom_gavs),
-        latest_version.number,
-    )
-    for g, a, v in sorted(pom_gavs):
-        log.info("repair_packages:   POM GAV %s:%s:%s", g, a, v)
-
-    # GAVs that already have a MavenPackage associated with this version.
-    package_gavs = set(
-        MavenPackage.objects.filter(pk__in=latest_version.content)
-        .values_list("group_id", "artifact_id", "version")
-        .iterator()
-    )
-
-    # Stranded = POM-backed but with no MavenPackage in the version.
-    missing_gavs = sorted(pom_gavs - package_gavs)
-    log.info(
-        "repair_packages: %d stranded GAV(s) (POM present, no MavenPackage):", len(missing_gavs)
-    )
-    for g, a, v in missing_gavs:
-        log.info("repair_packages:   MISSING %s:%s:%s", g, a, v)
-
-    # Idempotency: if nothing is stranded, don't open a new version at all.
-    if not missing_gavs:
-        log.info(
-            "repair_packages: repository=%r already consistent; nothing to repair.", repository.name
-        )
-        return
-
-    # --- do the fix: associate the missing MavenPackages in a new version ---
     from pulp_maven.app.models import _pull_through_ctx
 
-    # Suppress finalize_new_version's auto steps so we only touch packages (not
-    # metadata/index/bloom), then run the association ourselves in full-scan mode.
-    # full-scan is add-only here (every GAV is live), so no content is ever removed.
     version_before = latest_version.number
+    pkgs_before = MavenPackage.objects.filter(pk__in=latest_version.content).count()
+
+    # Suppress finalize_new_version's auto steps (metadata/index/bloom) so this version only
+    # touches package membership; the full-scan reconcile is run explicitly.
     _pull_through_ctx.active = True
     try:
         with repository.new_version() as new_version:
-            repository._ensure_packages(new_version, full_scan=True)
+            repository._ensure_packages_full_scan(new_version)
     finally:
         _pull_through_ctx.active = False
 
     new_latest = repository.latest_version()
-    if new_latest.number == version_before:
-        log.info(
-            "repair_packages: repository=%r — no new version created (nothing changed).",
-            repository.name,
-        )
-    else:
-        repaired_total = MavenPackage.objects.filter(pk__in=new_latest.content).count()
-        log.info(
-            "repair_packages: done. repository=%r version %s -> %s | MavenPackages now %d "
-            "(associated %d stranded GAV(s)).",
-            repository.name,
-            version_before,
-            new_latest.number,
-            repaired_total,
-            len(missing_gavs),
-        )
+    pkgs_after = MavenPackage.objects.filter(pk__in=new_latest.content).count()
+    log.info(
+        "repair_packages: repository=%r version %s -> %s | MavenPackages %d -> %d",
+        repository.name,
+        version_before,
+        new_latest.number,
+        pkgs_before,
+        pkgs_after,
+    )

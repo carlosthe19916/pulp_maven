@@ -124,6 +124,75 @@ def test_repair_packages_associates_missing_packages(
 
 
 @pytest.mark.parallel
+def test_repair_packages_handles_many_packages(
+    stranded_repo,
+    maven_package_api_client,
+    maven_repo_api_client,
+    monitor_task,
+):
+    """repair_packages associates many stranded packages in one run (exercises the full scan)."""
+    gavs = [("com.example", f"lib{i:02d}", "1.0.0") for i in range(12)]
+    repo = stranded_repo(gavs)
+
+    monitor_task(maven_repo_api_client.repair_packages(repo.pulp_href).task)
+
+    repo = maven_repo_api_client.read(repo.pulp_href)
+    assert maven_package_api_client.list(repository_version=repo.latest_version_href).count == 12
+
+
+@pytest.mark.parallel
+def test_repair_packages_removes_dead_packages(
+    maven_repo_factory,
+    maven_artifact_api_client,
+    maven_package_api_client,
+    maven_repo_api_client,
+    pom_file_factory,
+    monitor_task,
+):
+    """repair_packages removes a version MavenPackage whose GAV no longer has a POM (dead reconcile)."""
+    repo = maven_repo_factory()
+    uid = _uid()
+    group = f"com.example.{uid}"
+    group_path = group.replace(".", "/")
+
+    # Upload a POM so its MavenPackage is created and associated.
+    pom_path = pom_file_factory(
+        group_id=group, artifact_id="dead", version="1.0.0", name="Dead", packaging="jar"
+    )
+    pom = maven_artifact_api_client.upload(
+        file=str(pom_path), relative_path=f"{group_path}/dead/1.0.0/dead-1.0.0.pom"
+    )
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"add_content_units": [pom.pulp_href]}).task
+    )
+    repo = maven_repo_api_client.read(repo.pulp_href)
+    pkgs = maven_package_api_client.list(repository_version=repo.latest_version_href).results
+    assert len(pkgs) == 1
+    pkg_href = pkgs[0].pulp_href
+
+    # Remove the POM artifact (incremental finalize also drops the package) ...
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"remove_content_units": [pom.pulp_href]}).task
+    )
+    repo = maven_repo_api_client.read(repo.pulp_href)
+    assert maven_package_api_client.list(repository_version=repo.latest_version_href).count == 0
+
+    # ... then re-add only the package, leaving a dead membership (package present, no POM).
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"add_content_units": [pkg_href]}).task
+    )
+    repo = maven_repo_api_client.read(repo.pulp_href)
+    assert maven_package_api_client.list(repository_version=repo.latest_version_href).count == 1
+
+    monitor_task(maven_repo_api_client.repair_packages(repo.pulp_href).task)
+
+    repo = maven_repo_api_client.read(repo.pulp_href)
+    assert (
+        maven_package_api_client.list(repository_version=repo.latest_version_href).count == 0
+    ), "dead package (GAV with no POM) should be removed"
+
+
+@pytest.mark.parallel
 def test_repair_packages_ignores_pomless_gav(
     maven_repo_factory,
     maven_artifact_api_client,
