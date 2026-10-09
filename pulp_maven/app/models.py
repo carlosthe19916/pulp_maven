@@ -277,6 +277,22 @@ class MavenPackage(Content):
             ),
         ]
 
+    # Fields copied from a parsed POM.
+    POM_META_FIELDS = (
+        "name",
+        "description",
+        "packaging",
+        "url",
+        "licenses",
+        "dependencies",
+        "scm_url",
+    )
+
+    def _apply_pom_meta(self, meta):
+        """Copy parsed POM metadata onto this package in memory (does not save)."""
+        for field in self.POM_META_FIELDS:
+            setattr(self, field, meta[field])
+
     def update_from_pom(self, artifact):
         """Parse POM XML from an artifact file and populate metadata fields."""
         from pulp_maven.app.pom import parse_pom_metadata
@@ -291,13 +307,7 @@ class MavenPackage(Content):
         if meta is None:
             return
 
-        self.name = meta["name"]
-        self.description = meta["description"]
-        self.packaging = meta["packaging"]
-        self.url = meta["url"]
-        self.licenses = meta["licenses"]
-        self.dependencies = meta["dependencies"]
-        self.scm_url = meta["scm_url"]
+        self._apply_pom_meta(meta)
 
 
 class MavenIndexPage(Content):
@@ -753,29 +763,18 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
             new_version.remove_content(dead_pkgs)
 
     def _ensure_packages_full_scan(self, new_version):
-        """Reconcile MavenPackage membership across the ENTIRE version (repair_packages, PULP-2478).
+        """Reconcile MavenPackage membership across the whole version.
 
-        Unlike the incremental path, this scans the whole version and diffs in-memory sets instead of
-        building per-GAV ``OR`` filters -- the incremental path's ``OR``-of-``Q`` would exceed
-        PostgreSQL's 65535 bound-parameter limit at ~16-21k GAVs. POM parsing (S3 reads) is
-        parallelized. It associates every POM-backed GAV's package (creating missing ones) and
-        removes packages whose GAV no longer has a POM in the version.
+        Diffs in-memory sets rather than building per-GAV ``OR`` filters, which would exceed
+        PostgreSQL's bound-parameter limit on large repositories. POM parsing is parallelized.
+        Associates every POM-backed GAV's package (creating missing ones) and removes packages
+        whose GAV no longer has a POM.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         from pulpcore.plugin.models import ContentArtifact
 
         from pulp_maven.app.pom import parse_pom_metadata
-
-        meta_fields = (
-            "name",
-            "description",
-            "packaging",
-            "url",
-            "licenses",
-            "dependencies",
-            "scm_url",
-        )
 
         def _chunked(seq, size=1000):
             seq = list(seq)
@@ -802,8 +801,7 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
             .iterator()
         }
 
-        # 3. All MavenPackages in the domain (GAV -> pk): lets us reuse existing rows and decide
-        #    which POM GAVs still need a package created.
+        # 3. Every MavenPackage in the domain (GAV -> pk): reuse existing rows, spot GAVs to create.
         domain_pkg_pk_by_gav = {
             (g, a, v): pk
             for g, a, v, pk in MavenPackage.objects.filter(_pulp_domain=self.pulp_domain)
@@ -818,8 +816,7 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
             if gav not in domain_pkg_pk_by_gav or gav[2].endswith("-SNAPSHOT")
         }
 
-        # 5. Load those POM ContentArtifacts (chunked IN to stay under the param limit) and parse
-        #    them in parallel (the S3 reads are the dominant cost).
+        # 5. Load those POM artifacts (chunked to bound query size) and parse them in parallel.
         parsed_meta = {}
         ca_by_gav = {}
         if gavs_needing_pom:
@@ -834,6 +831,7 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
                     if gav and ca.artifact:
                         ca_by_gav[gav] = ca
 
+            # Threads only read files and return dicts; all DB writes stay on the main thread.
             def _parse(ca):
                 try:
                     with ca.artifact.file.open("rb") as fh:
@@ -847,13 +845,15 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
                 for fut in as_completed(futures):
                     parsed_meta[futures[fut]] = fut.result()
 
-        # 6. Create missing packages and apply parsed metadata (bulk-update the changed fields).
+        # 6. Create missing packages and apply parsed metadata.
         pkg_pk_by_gav = dict(domain_pkg_pk_by_gav)
         to_update = []
         created = 0
+        skipped_unreadable = 0
         for gav in gavs_needing_pom:
             # A brand-new package can't be created without a readable POM.
             if gav not in domain_pkg_pk_by_gav and gav not in ca_by_gav:
+                skipped_unreadable += 1
                 continue
             pkg, was_created = MavenPackage.objects.get_or_create(
                 group_id=gav[0], artifact_id=gav[1], version=gav[2], _pulp_domain=self.pulp_domain
@@ -862,14 +862,14 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
             created += int(was_created)
             meta = parsed_meta.get(gav)
             if meta:
-                for field in meta_fields:
-                    setattr(pkg, field, meta[field])
+                pkg._apply_pom_meta(meta)
                 to_update.append(pkg)
         if to_update:
-            MavenPackage.objects.bulk_update(to_update, meta_fields, batch_size=500)
+            MavenPackage.objects.bulk_update(
+                to_update, MavenPackage.POM_META_FIELDS, batch_size=500
+            )
 
-        # 7. Associate every POM GAV's package that is not already in the version.
-        #    Chunk the pk__in so the membership queries stay well under Postgres's param limit.
+        # 7. Associate every POM GAV's package not already present (chunked to bound query size).
         want_pks = {pkg_pk_by_gav[g] for g in pom_gavs if g in pkg_pk_by_gav}
         add_pks = want_pks - set(pkg_pk_in_version.values())
         for chunk in _chunked(add_pks, 10000):
@@ -881,11 +881,13 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
             new_version.remove_content(MavenPackage.objects.filter(pk__in=chunk))
 
         logger.info(
-            "repair_packages: full-scan reconcile pom_gavs=%d created=%d associated=%d removed=%d",
+            "repair_packages: full-scan reconcile pom_gavs=%d created=%d associated=%d removed=%d "
+            "skipped_unreadable=%d",
             len(pom_gavs),
             created,
             len(add_pks),
             len(dead_pks),
+            skipped_unreadable,
         )
 
     def _generate_metadata(self, new_version):

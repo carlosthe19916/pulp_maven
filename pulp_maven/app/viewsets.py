@@ -898,8 +898,9 @@ class MavenRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, Rol
 
     @extend_schema(
         description=(
-            "Trigger an asynchronous task to backfill missing MavenPackages for the "
-            "repository (PULP-2478)."
+            "Trigger an asynchronous task that reconciles MavenPackage membership for the "
+            "latest repository version: associate missing packages and remove packages whose "
+            "GAV no longer has a POM."
         ),
         summary="Repair packages",
         request=None,
@@ -907,9 +908,7 @@ class MavenRepositoryViewSet(RepositoryViewSet, ModifyRepositoryActionMixin, Rol
     )
     @action(detail=True, methods=["post"])
     def repair_packages(self, request, pk, **kwargs):
-        """
-        Dispatch a task to backfill missing MavenPackages (PULP-2478).
-        """
+        """Dispatch a task to reconcile MavenPackage membership for the latest version."""
         repository = self.get_object()
         result = dispatch(
             repair_packages,

@@ -1,13 +1,10 @@
-"""Tests for the repair_packages repository action (PULP-2478 / pulp_maven#508).
+"""Tests for the repair_packages repository action.
 
-These tests create the stranded state on current code with the "build then break" approach:
-upload POMs normally (their MavenPackages auto-associate), then remove the MavenPackage content
-units via ``modify`` while keeping the POM artifacts. The MavenPackage rows still exist globally but
-are no longer associated with the version -- exactly the production state the 0011 migration created.
+To create a stranded version (POMs present, no MavenPackage), upload POMs normally and then remove
+the MavenPackage content units via ``modify``, keeping the POM artifacts.
 
-Tests are ordered to follow the sequence of outcomes in ``repair_packages``: first the no-op branch
-(nothing to repair), then the repair branch (associate missing packages; POM-less GAVs ignored), then
-a repair followed by a no-op on re-run (idempotency).
+Tests are ordered to follow the branches of ``repair_packages``: the no-op branch first, then the
+repair branch (associate, POM-less ignored, dead reconcile), then repair-then-no-op (idempotency).
 """
 
 import uuid
@@ -187,9 +184,9 @@ def test_repair_packages_removes_dead_packages(
     monitor_task(maven_repo_api_client.repair_packages(repo.pulp_href).task)
 
     repo = maven_repo_api_client.read(repo.pulp_href)
-    assert (
-        maven_package_api_client.list(repository_version=repo.latest_version_href).count == 0
-    ), "dead package (GAV with no POM) should be removed"
+    assert maven_package_api_client.list(repository_version=repo.latest_version_href).count == 0, (
+        "dead package (GAV with no POM) should be removed"
+    )
 
 
 @pytest.mark.parallel
